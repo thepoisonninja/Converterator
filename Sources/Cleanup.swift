@@ -160,12 +160,12 @@ final class Cleanup: ObservableObject {
             let recorded = (log[f.standardizedFileURL.path] ?? []).map { URL(fileURLWithPath: $0) }
             if !recorded.isEmpty && recorded.allSatisfy({ totalSize([$0]) > 0 }) {
                 chds = recorded
-                trash = Converter.sourceFiles(for: f)
+                trash = Converter.sourceFiles(for: f) + Converter.companionFiles(for: f)
             } else if ext == "ecm" {
                 chds = covering(base: ECM.gameName(f), isPBP: false, in: dirs)
             } else if Converter.inputExtensions.contains(ext) {
                 chds = covering(base: f.deletingPathExtension().lastPathComponent, isPBP: ext == "pbp", in: dirs)
-                trash = Converter.sourceFiles(for: f)
+                trash = Converter.sourceFiles(for: f) + Converter.companionFiles(for: f)
             } else if Converter.archiveExtensions.contains(ext) {
                 let names = ext == "zip" ? Converter.zipEntryNames(f) : sevenZip.flatMap { sevenZipNames(f, tool: $0) }
                 func extOf(_ n: String) -> String { (n as NSString).pathExtension.lowercased() }

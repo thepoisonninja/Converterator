@@ -99,6 +99,13 @@ enum RedumpResult: Sendable, Codable {
         return n == tracks.count && n == expected ? .match(game) : .partial(game, n, expected)
     }
 
+    /// A whole disc image's SHA-1 looked up (for single-file discs, like GameCube and Wii).
+    static func lookup(sha1: String, index: RedumpIndex) -> RedumpResult {
+        let games = Set((index.roms[sha1.lowercased()] ?? []).map(\.game)).sorted()
+        guard let game = games.first else { return .noMatch }
+        return (index.trackCount[game] ?? 1) == 1 ? .match(game) : .partial(game, 1, index.trackCount[game] ?? 1)
+    }
+
     /// SHA-1 of a file, read in 8 MB chunks. `onBytes` is told how much was read each time.
     static func sha1Hex(of url: URL, onBytes: (Double) -> Void) -> String? {
         guard let h = try? FileHandle(forReadingFrom: url) else { return nil }

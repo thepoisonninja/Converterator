@@ -276,6 +276,10 @@ extension Converter {
             result = dir.appendingPathComponent(sheet.lastPathComponent)
             do {
                 try fm.copyItem(at: sheet, to: result)
+                // (Its LibCrypt .sbi too, so it ends up next to the CHD.)
+                if let sbi = Converter.sbiFile(for: sheet) {
+                    try fm.createSymbolicLink(at: dir.appendingPathComponent(sbi.lastPathComponent), withDestinationURL: sbi.resolvingSymlinksInPath())
+                }
                 var seen = Set<String>()
                 for name in Converter.trackNames(in: sheet) where seen.insert(name).inserted {
                     let out = dir.appendingPathComponent(name)

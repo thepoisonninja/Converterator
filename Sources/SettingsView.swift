@@ -69,7 +69,7 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Redump") {
-                Text("Redump lists the checksums of known good disc dumps. With its DAT files loaded, each BIN/CUE, GDI or ISO is checked before it's converted, and File → Check CHDs Against Redump… checks CHDs you already have. PBPs can't be checked.")
+                Text("Redump lists the checksums of known good disc dumps. With its DAT files loaded, each BIN/CUE, GDI or ISO is checked before it's converted, and File → Check Against Redump… checks CHDs and GameCube/Wii RVZs you already have (turn on GameCube and Wii below for RVZs). PBPs can't be checked.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Check dumps while converting", isOn: $redump.enabled)
                 Toggle("Name CHDs after the matching Redump game", isOn: $redump.renameToRedump)

@@ -86,7 +86,8 @@ struct LibraryReport: Sendable {
             if let d = DiscName.parse(name) { redumpDiscs[d.key] = max(redumpDiscs[d.key] ?? 0, d.of ?? d.disc) }
         }
         r.redumpNamed = r.chds.filter { redumpNames.contains($0.deletingPathExtension().lastPathComponent) }.count
-        for chd in r.chds {
+        let rvzs = all.filter { $0.pathExtension.lowercased() == "rvz" }
+        for chd in r.chds + rvzs {   // (GameCube/Wii RVZs are checked too)
             switch RedumpCache.result(for: chd, in: checked, datStamp: redump.stamp) {
             case .some(let res) where res.isMatch: r.redumpMatched += 1
             case .some: r.redumpNotMatching.append(chd)
@@ -129,7 +130,6 @@ struct LibraryReport: Sendable {
         r.needsPlaylist.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
         status("Looking for duplicates…")
-        let rvzs = all.filter { $0.pathExtension.lowercased() == "rvz" }
         (r.identical, r.versions) = duplicates(compressed: r.chds + rvzs, originals: unconverted,
                                                checked: checked, datStamp: redump.stamp)
         r.identicalBytes = r.identical.reduce(0) { $0 + $1.extraBytes }
@@ -341,6 +341,7 @@ final class Library: ObservableObject {
     @Published var folder: URL?
     @Published private(set) var report: LibraryReport?
     @Published var isScanning = false
+    @Published var hasLastSort = Organize.lastSort() != nil
     @Published var status = ""
     @Published var message = ""
 
@@ -476,6 +477,10 @@ struct LibraryView: View {
                     HStack {
                         Button("Sort into System Folders…") { m.sortIntoSystemFolders() }
                             .help("Moves the CHDs and RVZs here into a folder per system (PlayStation, Saturn…), with their playlists, and can rename them to their Redump names. You see what will happen first.")
+                        if m.hasLastSort {
+                            Button("Undo Last Sort…") { m.undoLastSort() }
+                                .help("Puts the files the last Sort into System Folders moved back where they were, with their old names.")
+                        }
                         Button("Add to RetroArch Playlists") { m.addToRetroArch() }
                             .help("Adds every game here to RetroArch's playlist for its system.")
                         Spacer()

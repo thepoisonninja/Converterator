@@ -679,6 +679,7 @@ final class Converter: ObservableObject {
     private struct GameResult {
         var made: [URL] = []
         var playlist: URL?               // the .m3u written for a multi-disc game
+        var extras: [URL] = []           // files kept with the CHD, like a LibCrypt .sbi
         var system: GameSystem?          // which console it's for, when known
         var skipped = 0                 // CHDs that already existed and weren't rewritten
         var bytesIn = 0.0, bytesOut = 0.0
@@ -770,6 +771,7 @@ final class Converter: ObservableObject {
 
         var total = GameResult()
         var perGame: [(made: [URL], playlist: URL?, system: GameSystem?)] = []
+        var extras: [URL] = []
         for (i, game) in games.enumerated() {
             let w = (span.end - span.start) / Double(games.count)
             let start = span.start + w * Double(i)
@@ -783,6 +785,7 @@ final class Converter: ObservableObject {
             total.redump += r.redump
             total.patchedWith = total.patchedWith ?? r.patchedWith
             perGame.append((r.made, r.playlist, r.system))
+            extras += r.extras
             if let system = r.system { for f in r.made { outputSystems[f.standardizedFileURL] = system } }
         }
         // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
@@ -805,7 +808,8 @@ final class Converter: ObservableObject {
 
         // Optional: RetroArch playlists, and a copy on a device.
         for g in perGame { addToRetroArch(made: g.made, playlist: g.playlist, system: g.system) }
-        if let note = await copyToDevice(made + perGame.compactMap(\.playlist), id: id) { summary += " · " + note }
+        if !extras.isEmpty { summary += " · with its .sbi" }
+        if let note = await copyToDevice(made + perGame.compactMap(\.playlist) + extras, id: id) { summary += " · " + note }
 
         // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
         if trashSources {
@@ -822,7 +826,7 @@ final class Converter: ObservableObject {
             } else {
                 var trashed = 0
                 // An archive goes to the Trash as a whole (every part of it); its unpacked copy is temporary anyway.
-                for f in Converter.sourceFiles(for: src) {
+                for f in Converter.sourceFiles(for: src) + Converter.companionFiles(for: src) {
                     do { try fm.trashItem(at: f, resultingItemURL: nil); trashed += 1 }
                     catch { append("  couldn't move \(f.lastPathComponent) to Trash: \(error.localizedDescription)") }
                 }
@@ -865,8 +869,17 @@ final class Converter: ObservableObject {
         // Optional: compare the track files with Redump's list of known good dumps. PBPs are a
         // repackaged format, so their contents never match Redump and aren't checked.
         var redump: RedumpResult?
-        // (WBFS, CISO, GCZ and WIA hold a GameCube/Wii disc in another form, so they can't be hashed as Redump lists them.)
-        if !isPBP, RedumpDB.shared.active, !["wbfs", "ciso", "gcz", "wia"].contains(src.pathExtension.lowercased()) {
+        // WBFS, CISO, GCZ and WIA hold a GameCube/Wii disc in another form: dolphin-tool works out the disc's SHA-1.
+        if !isPBP, RedumpDB.shared.active, ["wbfs", "ciso", "gcz", "wia"].contains(src.pathExtension.lowercased()),
+           let dolphin = Converter.findTool("dolphin-tool") {
+            update(id) { $0.detail = "Checking against Redump…"; $0.progress = nil }
+            if let sha = await Converter.discSHA1(src, dolphin: dolphin) {
+                let r = RedumpResult.lookup(sha1: sha, index: RedumpDB.shared.index)
+                append("  \(r.long)")
+                redump = r
+            }
+            if cancelRequested { fail("Cancelled"); return nil }
+        } else if !isPBP, RedumpDB.shared.active, !["wbfs", "ciso", "gcz", "wia"].contains(src.pathExtension.lowercased()) {
             let index = RedumpDB.shared.index
             let single = ["iso", "gcm"].contains(src.pathExtension.lowercased())
             let tracks = single ? [src] : Array(Converter.sourceFiles(for: src).dropFirst())
@@ -1087,6 +1100,22 @@ final class Converter: ObservableObject {
         if let redump { result.redump = [redump] }
         result.patchedWith = applied?.lastPathComponent
         result.system = system
+
+        // LibCrypt: a PAL PlayStation game's .sbi (the protection data emulators need, which a CHD doesn't
+        // hold) goes next to its CHD with the same name.
+        if result.made.count == 1, let sbi = Converter.sbiFile(for: src) {
+            let dest = result.made[0].deletingPathExtension().appendingPathExtension("sbi")
+            if fm.fileExists(atPath: dest.path) && !overwrite {
+                result.extras.append(dest)
+            } else {
+                try? fm.removeItem(at: dest)
+                do {
+                    try fm.copyItem(at: sbi.resolvingSymlinksInPath(), to: dest)
+                    result.extras.append(dest)
+                    append("  kept its LibCrypt data as \(dest.lastPathComponent)")
+                } catch { append("  couldn't copy \(sbi.lastPathComponent): \(error.localizedDescription)") }
+            }
+        }
 
         // Multi-disc playlist (named like the CHDs: a patched set gets the patched name)
         if result.made.count > 1 && makeM3U {
@@ -1335,6 +1364,26 @@ final class Converter: ObservableObject {
         }
     }
 
+    /// The SHA-1 of the plain disc image inside a GameCube/Wii file in any of Dolphin's formats (RVZ, WIA, GCZ,
+    /// WBFS, CISO, ISO), as Redump lists it, from `dolphin-tool verify`.
+    nonisolated static func discSHA1(_ file: URL, dolphin: URL) async -> String? {
+        let (status, lines) = await ToolRun.run(dolphin, ["verify", "-i", file.path, "-a", "sha1"], watchdog: false) { _ in }
+        guard status == 0 else { return nil }
+        for line in lines {
+            if let r = line.range(of: #"\b[0-9a-fA-F]{40}\b"#, options: .regularExpression) { return line[r].lowercased() }
+        }
+        return nil
+    }
+
+    /// The LibCrypt .sbi next to a game or CHD with the same name ("Game (Europe).sbi"), if there is one.
+    nonisolated static func sbiFile(for src: URL) -> URL? {
+        let base = src.deletingLastPathComponent().appendingPathComponent(gameName(src))
+        return ["sbi", "SBI"].map { base.appendingPathExtension($0) }.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// Files that belong with a game but aren't disc data (its LibCrypt .sbi): moved to the Trash with it.
+    nonisolated static func companionFiles(for src: URL) -> [URL] { sbiFile(for: src).map { [$0] } ?? [] }
+
     /// A game's name from its file: "Game.cue" → "Game", "Game.bin.ecm" → "Game".
     nonisolated static func gameName(_ url: URL) -> String {
         url.pathExtension.lowercased() == "ecm" ? ECM.gameName(url) : url.deletingPathExtension().lastPathComponent
@@ -1521,6 +1570,11 @@ final class Converter: ObservableObject {
         let extra = written.count - 1
         var summary = out.lastPathComponent + (extra > 0 ? " + \(extra) track file\(extra == 1 ? "" : "s")" : "")
         summary += " · \(formatBytes(size))"
+        // A LibCrypt .sbi kept with the CHD goes with the BIN/CUE too.
+        if let sbi = Converter.sbiFile(for: src) {
+            let dest = out.deletingPathExtension().appendingPathExtension("sbi")
+            if !fm.fileExists(atPath: dest.path), (try? fm.copyItem(at: sbi, to: dest)) != nil { summary += " · with its .sbi" }
+        }
 
         if trashSources {
             if size > 0 {

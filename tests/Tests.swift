@@ -637,6 +637,23 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         check(jobs.first?.state == .done && exists(rvz) && !exists(gcw.appendingPathComponent("GC Game (USA).chd")),
               "a GameCube ISO becomes an RVZ (not a CHD), verified", jobs.first?.detail ?? "")
         c.verify = false
+        // Checking an RVZ against Redump: dolphin-tool works out the SHA-1 of the disc inside
+        let gcSHA = sha1(gcw.appendingPathComponent("GC Game (USA).iso"))!
+        let gcDisc = await Converter.discSHA1(rvz, dolphin: Converter.findTool("dolphin-tool")!)
+        check(gcDisc == gcSHA, "an RVZ's disc SHA-1 is the original ISO's", gcDisc ?? "none")
+        var gcIndex = RedumpIndex()
+        gcIndex.roms[gcSHA] = [.init(game: "GC Game (USA)", name: "GC Game (USA).iso")]
+        gcIndex.trackCount["GC Game (USA)"] = 1
+        let noDAT = await CHDCheck.check(rvz, chdman: c.chdman!, index: gcIndex, started: { _ in }, progress: { _ in })
+        if case .failure(let e) = noDAT { check(e.message.contains("GameCube and Wii"), "without the GameCube/Wii DATs, it says to turn them on", e.message) }
+        else { check(false, "without the GameCube/Wii DATs, it says to turn them on") }
+        gcIndex.system["GC Game (USA)"] = "gc"
+        let rvzCheck = await CHDCheck.check(rvz, chdman: c.chdman!, index: gcIndex, started: { _ in }, progress: { _ in })
+        if case .success(.match(let g)) = rvzCheck { check(g == "GC Game (USA)", "an RVZ matches Redump") }
+        else { check(false, "an RVZ matches Redump", "\(rvzCheck)") }
+        CHDCheck.shared.items = []; CHDCheck.shared.add([gcw])
+        check(CHDCheck.shared.items.map(\.url.lastPathComponent).contains("GC Game (USA).rvz"), "Check Against Redump picks up RVZs in a folder")
+        CHDCheck.shared.items = []
         try? fm.moveItem(at: gcw.appendingPathComponent("GC Game (USA).iso"), to: gcw.appendingPathComponent("original.iso"))
         jobs = await runBatch([rvz])
         check(sha1(gcw.appendingPathComponent("GC Game (USA).iso")) == sha1(F.appendingPathComponent("gc/GC Game (USA).iso")),
@@ -837,6 +854,7 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         try! wiiRVZ.write(to: lib2.appendingPathComponent("wii game.rvz"))
         try! fm.copyItem(at: F.appendingPathComponent("chd/gd.chd"), to: lib2.appendingPathComponent("dc game.chd"))
         RedumpCache.store(lib2.appendingPathComponent("dc game.chd"), .match("Sea Adventure (USA)"))
+        try! Data("SBI\0".utf8).write(to: lib2.appendingPathComponent("dc game.sbi"))
         var lib2Index = RedumpIndex(); lib2Index.system["Sea Adventure (USA)"] = "dc"
         ConversionLog.record(source: W.appendingPathComponent("somewhere/dc game.gdi"), chds: [lib2.appendingPathComponent("dc game.chd")])
         let ra3 = W.appendingPathComponent("retroarch-sort"); try? fm.createDirectory(at: ra3, withIntermediateDirectories: true)
@@ -848,7 +866,7 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
                           "wii game.rvz": "Wii", "dc game.chd": "Dreamcast"], "each game's system worked out (from the CHD, the RVZ header, or Redump)", "\(planned)")
         check(plan.unknown.map(\.lastPathComponent) == ["mystery.chd"], "a game whose system can't be told stays", "\(plan.unknown.map(\.lastPathComponent))")
         check(plan.playlists.map(\.from.lastPathComponent) == ["Star.m3u"] && plan.renameable == 1, "the .m3u moves with its discs; one can take its Redump name")
-        let outcome = Organize.apply(plan, rename: true, retroArchFolder: ra3)
+        let outcome = Organize.apply(plan, folder: lib2, rename: true, retroArchFolder: ra3)
         check(outcome.moved == 5 && outcome.renamed == 1, "moved 5, renamed 1", "\(outcome)")
         check(exists(lib2.appendingPathComponent("PlayStation/Star (Disc 2).chd")) && exists(lib2.appendingPathComponent("PlayStation/Star.m3u"))
               && exists(lib2.appendingPathComponent("Dreamcast/Sea Adventure (USA).chd")) && exists(lib2.appendingPathComponent("Wii/wii game.rvz"))
@@ -861,8 +879,47 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         let ra3Items = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: ra3.appendingPathComponent("Sony - PlayStation 2.lpl")))) as? [String: Any])?["items"] as? [[String: Any]] ?? []
         check(ra3Items.first?["path"] as? String == lib2.appendingPathComponent("PlayStation 2/ps2 game.chd").standardizedFileURL.path && outcome.playlistEntries == 1,
               "RetroArch playlists point at the new places", "\(ra3Items)")
+        check(exists(lib2.appendingPathComponent("Dreamcast/Sea Adventure (USA).sbi")) && !exists(lib2.appendingPathComponent("dc game.sbi")),
+              "a game's .sbi moves and is renamed with it")
         let again = Organize.plan(folder: lib2, style: .readable, index: lib2Index, checked: RedumpCache.all(), chdman: chdman)
         check(again.moves.isEmpty, "a second run finds nothing to move")
+        // Undo Last Sort
+        check(Organize.lastSort()?.moves.count == 7, "the sort is recorded (5 games, a .sbi, an .m3u)", "\(Organize.lastSort()?.moves.count ?? -1)")
+        let undone = Organize.undoLast(retroArchFolder: ra3)
+        let afterUndo = ((fm.enumerator(atPath: lib2.path)?.allObjects as? [String]) ?? []).sorted()
+        check(undone.restored == 7 && undone.skipped == 0
+              && afterUndo == ["Saturn", "Saturn/already sorted.chd", "Star (Disc 1).chd", "Star (Disc 2).chd", "Star.m3u",
+                               "dc game.chd", "dc game.sbi", "mystery.chd", "ps2 game.chd", "wii game.rvz"],
+              "Undo Last Sort puts every file back with its old name, and removes the folders it made", "\(undone) \(afterUndo)")
+        check(((try? String(contentsOf: lib2.appendingPathComponent("Star.m3u"), encoding: .utf8)) ?? "") == "Star (Disc 1).chd\nStar (Disc 2).chd\n",
+              "the .m3u is back as it was")
+        check(RedumpCache.lookup(lib2.appendingPathComponent("dc game.chd"))?.isMatch == true
+              && ConversionLog.load()[W.appendingPathComponent("somewhere/dc game.gdi").standardizedFileURL.path]?.first?.hasSuffix("sort-library/dc game.chd") == true,
+              "the Redump result and Clean Up Originals' record go back too")
+        let ra3Back = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: ra3.appendingPathComponent("Sony - PlayStation 2.lpl")))) as? [String: Any])?["items"] as? [[String: Any]] ?? []
+        check(ra3Back.first?["path"] as? String == lib2.appendingPathComponent("ps2 game.chd").standardizedFileURL.path, "RetroArch playlists point back", "\(ra3Back)")
+        check(Organize.lastSort() == nil, "there's nothing left to undo")
+
+        // MARK: LibCrypt
+        section("LibCrypt .sbi files")
+        let sbiGame = workspace("sbi", from: F, ["ps1/PS1 Game (Disc 1).cue", "ps1/PS1 Game (Disc 1).bin"], into: W)
+        try! Data("SBI\0libcrypt".utf8).write(to: sbiGame.appendingPathComponent("PS1 Game (Disc 1).sbi"))
+        let sbiOut = W.appendingPathComponent("sbi-out"), sbiBack = W.appendingPathComponent("sbi-back")
+        c.outputDir = sbiOut
+        jobs = await runBatch([sbiGame.appendingPathComponent("PS1 Game (Disc 1).cue")])
+        check(sha1(sbiOut.appendingPathComponent("PS1 Game (Disc 1).sbi")) == sha1(sbiGame.appendingPathComponent("PS1 Game (Disc 1).sbi"))
+              && jobs.first?.detail.contains("with its .sbi") == true, "the .sbi goes next to the CHD, with the same name", jobs.first?.detail ?? "")
+        check(Cleanup.scanSources(in: sbiGame, outputDir: sbiOut, sevenZip: nil).converted.first?.files.contains { $0.pathExtension == "sbi" } == true,
+              "Clean Up Originals counts the .sbi as one of the originals")
+        c.outputDir = sbiBack
+        jobs = await runBatch([sbiOut.appendingPathComponent("PS1 Game (Disc 1).chd")])
+        check(exists(sbiBack.appendingPathComponent("PS1 Game (Disc 1).sbi")), "extracting the CHD brings the .sbi back next to the .cue", jobs.first?.detail ?? "")
+        let sbiECM = workspace("sbi-ecm", from: F, ["ecm/ECM Game.cue", "ecm/ECM Game.bin.ecm"], into: W)
+        try! Data("SBI\0".utf8).write(to: sbiECM.appendingPathComponent("ECM Game.sbi"))
+        c.outputDir = sbiOut
+        jobs = await runBatch([sbiECM.appendingPathComponent("ECM Game.cue")])
+        check(exists(sbiOut.appendingPathComponent("ECM Game.sbi")), "an ECM game's .sbi too", jobs.first?.detail ?? "")
+        c.outputDir = nil
 
         // MARK: Extra copies
         section("Extra copies")

@@ -1,4 +1,4 @@
-// Converterator — File → Check CHDs Against Redump…, and the shared tool runner.
+// Converterator — File → Check Against Redump… (CHDs and GameCube/Wii RVZs), and the shared tool runner.
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -49,8 +49,8 @@ final class CHDCheck: ObservableObject {
             guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
                 let all = fm.enumerator(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?.allObjects as? [URL] ?? []
-                found += all.filter { $0.pathExtension.lowercased() == "chd" }
-            } else if url.pathExtension.lowercased() == "chd" {
+                found += all.filter { ["chd", "rvz"].contains($0.pathExtension.lowercased()) }
+            } else if ["chd", "rvz"].contains(url.pathExtension.lowercased()) {
                 found.append(url)
             }
         }
@@ -98,7 +98,7 @@ final class CHDCheck: ObservableObject {
             let matched = done.filter { $0.result?.isMatch == true }.count
             let known = done.filter(\.remembered).count
             if !done.isEmpty {
-                message = "\(matched) of \(done.count) checked CHD\(done.count == 1 ? "" : "s") match Redump."
+                message = "\(matched) of \(done.count) checked game\(done.count == 1 ? "" : "s") match Redump."
                     + (known > 0 ? " \(known) unchanged since an earlier check, so not unpacked again." : "")
             }
         }
@@ -115,7 +115,7 @@ final class CHDCheck: ObservableObject {
         for i in items.indices {
             guard let name = items[i].suggestedName else { continue }
             let old = items[i].url
-            let new = old.deletingLastPathComponent().appendingPathComponent(name + ".chd")
+            let new = old.deletingLastPathComponent().appendingPathComponent(name + "." + old.pathExtension)
             if fm.fileExists(atPath: new.path) { skipped.append(old.lastPathComponent); continue }
             do {
                 try fm.moveItem(at: old, to: new)
@@ -128,7 +128,7 @@ final class CHDCheck: ObservableObject {
                 skipped.append(old.lastPathComponent)
             }
         }
-        message = "Renamed \(renamed) CHD\(renamed == 1 ? "" : "s")."
+        message = "Renamed \(renamed) file\(renamed == 1 ? "" : "s")."
             + (skipped.isEmpty ? "" : " Left \(skipped.count) alone because a file with the new name already exists, or it couldn't be renamed.")
     }
 
@@ -151,6 +151,19 @@ final class CHDCheck: ObservableObject {
     nonisolated static func check(_ chd: URL, chdman: URL, index: RedumpIndex,
                                   started: @escaping @Sendable (Process) -> Void,
                                   progress: @escaping @Sendable (Double) -> Void) async -> Result<RedumpResult, CheckError> {
+        // A GameCube/Wii RVZ: dolphin-tool works out the SHA-1 of the disc inside, with nothing unpacked.
+        if chd.pathExtension.lowercased() == "rvz" {
+            guard let dolphin = Converter.findTool("dolphin-tool") else { return .failure(CheckError(message: "dolphin-tool is missing from the app")) }
+            guard index.system.values.contains(where: { $0 == "gc" || $0 == "wii" }) else {
+                return .failure(CheckError(message: "Turn on GameCube and Wii in Settings → Redump DAT files to check RVZs"))
+            }
+            progress(0)
+            guard let sha = await Converter.discSHA1(chd, dolphin: dolphin) else {
+                return .failure(CheckError(message: "dolphin-tool couldn't read this RVZ (is it damaged?)"))
+            }
+            progress(1)
+            return .success(RedumpResult.lookup(sha1: sha, index: index))
+        }
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory.appendingPathComponent("converterator-check-\(UUID().uuidString)", isDirectory: true)
         defer { try? fm.removeItem(at: tmp) }
@@ -271,7 +284,7 @@ struct CHDCheckView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Check CHDs you already have against Redump's list of known good dumps. Each CHD is unpacked to a temporary folder, checked, and the temporary files deleted, so it takes a little while and needs free space for one disc.")
+            Text("Check CHDs and GameCube/Wii RVZs you already have against Redump's list of known good dumps. Each CHD is unpacked to a temporary folder, checked, and the temporary files deleted, so it takes a little while and needs free space for one disc. An RVZ is checked without unpacking (turn on GameCube and Wii in Settings → Redump DAT files).")
                 .foregroundStyle(.secondary)
             if redump.index.isEmpty {
                 HStack {
@@ -281,7 +294,7 @@ struct CHDCheckView: View {
                 }
             }
             HStack {
-                Button("Add CHDs…") { pick(folders: false) }
+                Button("Add Files…") { pick(folders: false) }
                 Button("Choose Folder…") { pick(folders: true) }
                 Button("Clear") { m.clear() }.disabled(m.isRunning || m.items.isEmpty)
                 Spacer()
@@ -316,7 +329,7 @@ struct CHDCheckView: View {
             Button("Rename") { m.renameMatches() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Each matching CHD gets its Redump game's name, for example “Armored Core (USA).chd”. Any .m3u playlist next to it is updated. A CHD is left alone if a file with the new name already exists.")
+            Text("Each matching CHD or RVZ gets its Redump game's name, for example “Armored Core (USA).chd”. Any .m3u playlist next to it is updated. A file is left alone if one with the new name already exists.")
         }
     }
 
@@ -371,8 +384,8 @@ struct CHDCheckView: View {
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = !folders
         panel.canChooseDirectories = folders
-        if !folders { panel.allowedContentTypes = [UTType(filenameExtension: "chd")].compactMap { $0 } }
-        panel.message = folders ? "Choose a folder of CHDs (subfolders are included)" : "Choose CHD files to check"
+        if !folders { panel.allowedContentTypes = [UTType(filenameExtension: "chd"), UTType(filenameExtension: "rvz")].compactMap { $0 } }
+        panel.message = folders ? "Choose a folder of CHDs and RVZs (subfolders are included)" : "Choose CHD or RVZ files to check"
         let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK { m.add(panel.urls) } }
         if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
     }
