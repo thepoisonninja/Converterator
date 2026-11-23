@@ -22,7 +22,7 @@ enum RetroArch {
     /// Adds these games to `<folder>/<RetroArch's name for the system>.lpl`, replacing any entry with the same
     /// path and keeping everything else in the playlist as it was. Returns the playlist file.
     @discardableResult
-    nonisolated static func add(_ entries: [Entry], system: GameSystem, folder: URL) throws -> URL {
+    nonisolated static func add(_ entries: [Entry], system: GameSystem, folder: URL, replacing: [URL] = []) throws -> URL {
         let file = folder.appendingPathComponent(system.retroArch + ".lpl")
         var root: [String: Any] = [
             "version": "1.5", "default_core_path": "", "default_core_name": "",
@@ -35,7 +35,8 @@ enum RetroArch {
             root = existing
         }
         var items = root["items"] as? [[String: Any]] ?? []
-        let paths = Set(entries.map(\.path.standardizedFileURL.path))
+        // (Also taking out `replacing`: the separate discs of a game now listed through its .m3u.)
+        let paths = Set((entries.map(\.path) + replacing).map(\.standardizedFileURL.path))
         items.removeAll { paths.contains(URL(fileURLWithPath: $0["path"] as? String ?? "/").standardizedFileURL.path) }
         for e in entries {
             items.append(["path": e.path.standardizedFileURL.path, "label": e.label, "core_path": "DETECT", "core_name": "DETECT",
@@ -47,6 +48,36 @@ enum RetroArch {
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         try data.write(to: file, options: .atomic)
         return file
+    }
+
+    /// Points playlist entries at files' new places after they're moved or renamed, in every playlist in
+    /// `folder`. Returns how many entries changed.
+    @discardableResult
+    nonisolated static func relocate(_ moves: [URL: URL], folder: URL) -> Int {
+        let map = Dictionary(moves.map { (Systems.pathKey($0.key), $0.value.standardizedFileURL.path) }, uniquingKeysWith: { a, _ in a })
+        var changed = 0
+        let files = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension.lowercased() == "lpl" }
+        for file in files {
+            guard let data = try? Data(contentsOf: file),
+                  var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  var items = root["items"] as? [[String: Any]] else { continue }
+            var here = 0
+            for i in items.indices {
+                guard let path = items[i]["path"] as? String,
+                      let new = map[Systems.pathKey(URL(fileURLWithPath: path))] else { continue }
+                items[i]["path"] = new
+                if items[i]["label"] as? String == URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent {
+                    items[i]["label"] = URL(fileURLWithPath: new).deletingPathExtension().lastPathComponent
+                }
+                here += 1
+            }
+            guard here > 0 else { continue }
+            root["items"] = items
+            if let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+               (try? out.write(to: file, options: .atomic)) != nil { changed += here }
+        }
+        return changed
     }
 
     /// Games in a folder (CHDs, RVZs and .m3u playlists), grouped by system, for "Add to RetroArch Playlists".

@@ -183,7 +183,105 @@ enum Systems {
         return [UInt8](d)
     }
 
+    /// A path to compare files by, the same however the folder was spelled (/var vs /private/var), even after
+    /// the file itself has moved away.
+    nonisolated static func pathKey(_ u: URL) -> String {
+        u.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path + "/" + u.lastPathComponent
+    }
+
     nonisolated static func be32(_ b: [UInt8], _ i: Int) -> UInt32 {
         UInt32(b[i]) << 24 | UInt32(b[i + 1]) << 16 | UInt32(b[i + 2]) << 8 | UInt32(b[i + 3])
+    }
+}
+
+// MARK: - Telling a CHD's system
+
+extension Systems {
+    /// A CHD's metadata entries (tag and text), read from the file without decompressing anything.
+    nonisolated static func chdMetadata(_ url: URL) -> [(tag: String, text: String)] {
+        guard let head = read(url, at: 0, 124), head.count >= 64, head.prefix(8).elementsEqual("MComprHD".utf8) else { return [] }
+        func be64(_ b: [UInt8], _ i: Int) -> UInt64 { (0..<8).reduce(UInt64(0)) { $0 << 8 | UInt64(b[i + $1]) } }
+        let version = be32(head, 12)
+        var offset: UInt64
+        switch version {
+        case 5: offset = be64(head, 48)
+        case 4, 3: offset = be64(head, 36)
+        default: return []
+        }
+        var entries: [(String, String)] = []
+        while offset != 0, entries.count < 512, let e = read(url, at: offset, 16), e.count == 16 {
+            let tag = String(decoding: e[0..<4], as: UTF8.self)
+            let length = Int(be32(e, 4) & 0x00FF_FFFF)
+            let data = length > 0 ? (read(url, at: offset + 16, min(length, 4096)) ?? []) : []
+            entries.append((tag, String(decoding: data.prefix { $0 != 0 }, as: UTF8.self)))
+            offset = be64(e, 8)
+        }
+        return entries
+    }
+
+    /// The system a CHD is for: a GD-ROM is a Dreamcast game; otherwise the start of its first data track is
+    /// read (chdman extracts just those few hundred KB) and looked at like a disc image.
+    nonisolated static func detectCHD(_ chd: URL, chdman: URL) -> GameSystem? {
+        let meta = chdMetadata(chd)
+        let tags = Set(meta.map(\.tag))
+        if tags.contains("CHGD") || tags.contains("CHGT") { return byID("dc") }
+        let isDVD = tags.contains("DVD ")
+        var start = 0, sectorSize = 2048, dataOffset = 0, frames = 1024
+        if !isDVD {
+            // CD: tracks one after another, each padded to a multiple of 4 frames of 2448 bytes.
+            let tracks = meta.filter { ["CHT2", "CHTR"].contains($0.tag) }.map { m -> [String: String] in
+                var f: [String: String] = [:]
+                for part in m.text.split(separator: " ") {
+                    let kv = part.split(separator: ":", maxSplits: 1)
+                    if kv.count == 2 { f[String(kv[0])] = String(kv[1]) }
+                }
+                return f
+            }.sorted { Int($0["TRACK"] ?? "") ?? 0 < Int($1["TRACK"] ?? "") ?? 0 }
+            guard !tracks.isEmpty else { return nil }
+            var frame = 0
+            var found = false
+            for t in tracks {
+                let n = Int(t["FRAMES"] ?? "") ?? 0
+                let type = t["TYPE"] ?? "AUDIO"
+                if type != "AUDIO" {
+                    // A pregap stored in the track ("V…") comes before its first sector.
+                    if (t["PGTYPE"] ?? "").hasPrefix("V") { frame += Int(t["PREGAP"] ?? "") ?? 0 }
+                    start = frame * 2448
+                    sectorSize = 2448
+                    switch type {
+                    case "MODE1_RAW": dataOffset = 16
+                    case "MODE2_RAW": dataOffset = 24
+                    case "MODE2", "MODE2_FORM_MIX": dataOffset = 8
+                    default: dataOffset = 0   // MODE1, MODE2_FORM1: just the 2048 bytes
+                    }
+                    found = true
+                    break
+                }
+                frame += (n + 3) / 4 * 4
+            }
+            guard found else { return nil }
+            frames = 600
+        }
+        // No more than the disc holds (chdman refuses to read past the end).
+        guard let head = read(chd, at: 0, 48), head.count == 48 else { return nil }
+        func be64(_ i: Int) -> Int { Int((0..<8).reduce(UInt64(0)) { $0 << 8 | UInt64(head[i + $1]) }) }
+        let logical = be32(head, 12) == 5 ? be64(32) : be64(28)
+        let length = min(frames * sectorSize, logical - start)
+        guard length >= 17 * sectorSize else { return nil }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("converterator-peek-\(UUID().uuidString).bin")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let p = Process()
+        p.executableURL = chdman
+        p.arguments = ["extractraw", "-i", chd.path, "-o", tmp.path, "-f",
+                       "--inputstartbyte", String(start), "--inputbytes", String(length)]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        let found = detect(reader: SectorReader(file: tmp, sectorSize: sectorSize, dataOffset: dataOffset))
+        // A DVD can't be a PS1 game: "PLAYSTATION" on a DVD is a PS2 disc.
+        if isDVD, found?.id == "psx" { return byID("ps2") }
+        if isDVD, found == nil, isXbox(tmp) { return byID("xbox") }
+        return found
     }
 }

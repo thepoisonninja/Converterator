@@ -38,10 +38,10 @@ struct DiscName: Hashable, Sendable {
 }
 
 enum Playlist {
-    /// Multi-disc CHD sets in one folder: playlist name → its CHDs in disc order. Only sets with 2+ discs.
+    /// Multi-disc CHD (or RVZ) sets in one folder: playlist name → its files in disc order. Only sets with 2+ discs.
     nonisolated static func sets(in dir: URL) -> [String: [URL]] {
         let chds = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension.lowercased() == "chd" }
+            .filter { ["chd", "rvz"].contains($0.pathExtension.lowercased()) }   // (Dolphin reads .m3u too)
         var groups: [String: [(Int, URL)]] = [:]
         for chd in chds {
             guard let d = DiscName.parse(chd.deletingPathExtension().lastPathComponent) else { continue }

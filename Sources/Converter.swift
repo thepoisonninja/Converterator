@@ -630,7 +630,7 @@ final class Converter: ObservableObject {
                 return
             }
             batchEnd = Date()
-            writePlaylists()
+            await writePlaylists()
             append(cancelRequested ? "— Cancelled —" : "— All done —")
             if !cancelRequested {
                 Notifier.batchFinished(counts: batchCountsText, saved: batchSavedText, failed: batchFailedCount > 0)
@@ -640,13 +640,35 @@ final class Converter: ObservableObject {
 
     /// After a batch: an .m3u for each multi-disc game that now has 2+ CHDs in a folder
     /// ("Game (Disc 1).chd", "Game (Disc 2).chd" → "Game.m3u"), when "Make .m3u playlist" is on.
-    private func writePlaylists() {
+    /// Then RetroArch lists the game once, through its .m3u, and the .m3u goes to the device with the discs.
+    private func writePlaylists() async {
         guard makeM3U else { return }
         let made = Set(batchJobs.flatMap(\.outputs).map(\.standardizedFileURL))
         let dirs = Set(made.map { $0.deletingLastPathComponent() })
+        var written: [URL] = []
         for dir in dirs {
-            for m3u in Playlist.make(in: dir, only: made) { append("wrote \(m3u.lastPathComponent)") }
+            for m3u in Playlist.make(in: dir, only: made) { append("wrote \(m3u.lastPathComponent)"); written.append(m3u) }
         }
+        for m3u in written {
+            let discs = ((try? String(contentsOf: m3u, encoding: .utf8)) ?? "").components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+                .map { m3u.deletingLastPathComponent().appendingPathComponent($0).standardizedFileURL }
+            if retroArchPlaylists, let system = discs.lazy.compactMap({ self.outputSystems[$0] }).first {
+                do {
+                    try RetroArch.add([RetroArch.Entry(path: m3u, label: m3u.deletingPathExtension().lastPathComponent)],
+                                      system: system, folder: retroArchPlaylistFolder, replacing: discs)
+                    append("  \(m3u.lastPathComponent) put in RetroArch's “\(system.retroArch)” playlist in place of its discs")
+                } catch { append("  couldn't update the RetroArch playlist: \(error.localizedDescription)") }
+            }
+            if copyDestination != nil, let note = await copyToDevice([m3u], id: nil) { append("  \(m3u.lastPathComponent): \(note)") }
+        }
+    }
+
+    /// The console each CHD/RVZ made in this session is for (for its .m3u's RetroArch playlist).
+    private static var outputSystemsStore: [URL: GameSystem] = [:]
+    var outputSystems: [URL: GameSystem] {
+        get { Converter.outputSystemsStore }
+        set { Converter.outputSystemsStore = newValue }
     }
 
     func update(_ id: UUID, _ change: (inout Job) -> Void) {
@@ -761,6 +783,7 @@ final class Converter: ObservableObject {
             total.redump += r.redump
             total.patchedWith = total.patchedWith ?? r.patchedWith
             perGame.append((r.made, r.playlist, r.system))
+            if let system = r.system { for f in r.made { outputSystems[f.standardizedFileURL] = system } }
         }
         // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
         // (Likewise a patched CHD is compared with the CHD it came from.)

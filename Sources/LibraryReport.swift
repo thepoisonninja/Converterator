@@ -340,8 +340,8 @@ final class Library: ObservableObject {
 
     @Published var folder: URL?
     @Published private(set) var report: LibraryReport?
-    @Published private(set) var isScanning = false
-    @Published private(set) var status = ""
+    @Published var isScanning = false
+    @Published var status = ""
     @Published var message = ""
 
     func scan(_ folder: URL) {
@@ -472,9 +472,17 @@ struct LibraryView: View {
                 if !redump.index.isEmpty {
                     row("Named as in Redump", "\(r.redumpNamed) of \(r.chds.count)")
                 }
-            } header: {
-                header("Summary", nil, action: r.chds.isEmpty ? nil : ("Add to RetroArch Playlists", { m.addToRetroArch() }))
-            }
+                if !r.chds.isEmpty {
+                    HStack {
+                        Button("Sort into System Folders…") { m.sortIntoSystemFolders() }
+                            .help("Moves the CHDs and RVZs here into a folder per system (PlayStation, Saturn…), with their playlists, and can rename them to their Redump names. You see what will happen first.")
+                        Button("Add to RetroArch Playlists") { m.addToRetroArch() }
+                            .help("Adds every game here to RetroArch's playlist for its system.")
+                        Spacer()
+                    }
+                    .disabled(c.isRunning)
+                }
+            } header: { Text("Summary") }
 
             Section {
                 if r.unconverted.isEmpty { Text("Everything here is converted.").foregroundStyle(.secondary) }

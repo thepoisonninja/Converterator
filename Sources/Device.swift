@@ -11,7 +11,7 @@ extension Converter {
 
     /// Copies a finished game's files (CHDs, RVZ, playlist, PBP…) to the device folder, skipping ones already
     /// there at the same size. Returns a few words for the job's summary, or nil when copying is off.
-    func copyToDevice(_ files: [URL], id: UUID) async -> String? {
+    func copyToDevice(_ files: [URL], id: UUID?) async -> String? {
         guard let device = copyDestination, !files.isEmpty else { return nil }
         let fm = FileManager.default
         let place = DiskSpace.volumeName(device)
@@ -30,7 +30,7 @@ extension Converter {
             append("  not copied: \(place) has \(formatBytes(free)) free and this needs \(formatBytes(needed))")
             return "not copied: not enough space on \(place)"
         }
-        update(id) { $0.detail = "Copying to \(place)…"; $0.progress = nil }
+        if let id { update(id) { $0.detail = "Copying to \(place)…"; $0.progress = nil } }
         let failure: String? = await Task.detached {
             for (from, to) in todo {
                 do {

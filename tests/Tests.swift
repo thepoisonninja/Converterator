@@ -801,6 +801,69 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         check(psx == ["Solo (USA)", "Two"] && unknownGames.map(\.lastPathComponent) == ["Mystery.chd"],
               "library: system from the folder, a multi-disc game through its .m3u, unknown ones left out", "\(psx) / \(unknownGames)")
 
+        // A multi-disc game converted disc by disc: its .m3u goes into RetroArch in place of the discs, and to the device
+        let md = workspace("multidisc", from: F, ["ps1/PS1 Game (Disc 1).cue", "ps1/PS1 Game (Disc 1).bin",
+                                                  "ps1/PS1 Game (Disc 2).cue", "ps1/PS1 Game (Disc 2).bin"], into: W)
+        let ra2 = W.appendingPathComponent("retroarch-multidisc"), device2 = W.appendingPathComponent("device-multidisc")
+        try? fm.createDirectory(at: device2, withIntermediateDirectories: true)
+        c.organizeBySystem = true; c.retroArchPlaylists = true; c.retroArchFolder = ra2; c.copyDestination = device2
+        jobs = await runBatch([md])
+        let mdM3U = md.appendingPathComponent("PlayStation/PS1 Game.m3u")
+        check(((try? String(contentsOf: mdM3U, encoding: .utf8)) ?? "") == "PS1 Game (Disc 1).chd\nPS1 Game (Disc 2).chd\n",
+              "the batch writes PS1 Game.m3u next to the discs, in the system folder")
+        let mdItems = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: ra2.appendingPathComponent("Sony - PlayStation.lpl")))) as? [String: Any])?["items"] as? [[String: Any]] ?? []
+        check(mdItems.count == 1 && mdItems.first?["path"] as? String == mdM3U.standardizedFileURL.path && mdItems.first?["label"] as? String == "PS1 Game",
+              "RetroArch lists the game once, through its .m3u", "\(mdItems.map { $0["label"] ?? "" })")
+        check(exists(device2.appendingPathComponent("PlayStation/PS1 Game.m3u")) && exists(device2.appendingPathComponent("PlayStation/PS1 Game (Disc 2).chd")),
+              "the .m3u is copied to the device with the discs")
+        c.organizeBySystem = false; c.retroArchPlaylists = false; c.retroArchFolder = nil; c.copyDestination = nil
+
+        // MARK: Sorting a library into system folders
+        section("Sorting a library into system folders")
+        let chdman = c.chdman!
+        for (file, want) in [(F.appendingPathComponent("ps1/PS1 Game (Disc 1).chd"), "PlayStation"), (F.appendingPathComponent("chd/ps2.chd"), "PlayStation 2"),
+                             (F.appendingPathComponent("chd/gd.chd"), "Dreamcast"), (F.appendingPathComponent("chd/game.chd"), "unknown")] {
+            check((Systems.detectCHD(file, chdman: chdman)?.folder ?? "unknown") == want, "CHD \(file.lastPathComponent) → \(want)",
+                  Systems.detectCHD(file, chdman: chdman)?.folder ?? "unknown")
+        }
+        let lib2 = W.appendingPathComponent("sort-library")
+        try? fm.createDirectory(at: lib2.appendingPathComponent("Saturn"), withIntermediateDirectories: true)
+        try! fm.copyItem(at: F.appendingPathComponent("ps1/PS1 Game (Disc 1).chd"), to: lib2.appendingPathComponent("Star (Disc 1).chd"))
+        try! fm.copyItem(at: F.appendingPathComponent("ps1/PS1 Game (Disc 1).chd"), to: lib2.appendingPathComponent("Star (Disc 2).chd"))
+        try! "Star (Disc 1).chd\nStar (Disc 2).chd\n".write(to: lib2.appendingPathComponent("Star.m3u"), atomically: true, encoding: .utf8)
+        try! fm.copyItem(at: F.appendingPathComponent("chd/ps2.chd"), to: lib2.appendingPathComponent("ps2 game.chd"))
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: lib2.appendingPathComponent("mystery.chd"))
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: lib2.appendingPathComponent("Saturn/already sorted.chd"))
+        try! wiiRVZ.write(to: lib2.appendingPathComponent("wii game.rvz"))
+        try! fm.copyItem(at: F.appendingPathComponent("chd/gd.chd"), to: lib2.appendingPathComponent("dc game.chd"))
+        RedumpCache.store(lib2.appendingPathComponent("dc game.chd"), .match("Sea Adventure (USA)"))
+        var lib2Index = RedumpIndex(); lib2Index.system["Sea Adventure (USA)"] = "dc"
+        ConversionLog.record(source: W.appendingPathComponent("somewhere/dc game.gdi"), chds: [lib2.appendingPathComponent("dc game.chd")])
+        let ra3 = W.appendingPathComponent("retroarch-sort"); try? fm.createDirectory(at: ra3, withIntermediateDirectories: true)
+        try! #"{"items":[{"path":"\#(lib2.appendingPathComponent("ps2 game.chd").standardizedFileURL.path)","label":"ps2 game"}]}"#
+            .write(to: ra3.appendingPathComponent("Sony - PlayStation 2.lpl"), atomically: true, encoding: .utf8)
+        let plan = Organize.plan(folder: lib2, style: .readable, index: lib2Index, checked: RedumpCache.all(), chdman: chdman)
+        let planned = Dictionary(uniqueKeysWithValues: plan.moves.map { ($0.from.lastPathComponent, $0.toDir.lastPathComponent) })
+        check(planned == ["Star (Disc 1).chd": "PlayStation", "Star (Disc 2).chd": "PlayStation", "ps2 game.chd": "PlayStation 2",
+                          "wii game.rvz": "Wii", "dc game.chd": "Dreamcast"], "each game's system worked out (from the CHD, the RVZ header, or Redump)", "\(planned)")
+        check(plan.unknown.map(\.lastPathComponent) == ["mystery.chd"], "a game whose system can't be told stays", "\(plan.unknown.map(\.lastPathComponent))")
+        check(plan.playlists.map(\.from.lastPathComponent) == ["Star.m3u"] && plan.renameable == 1, "the .m3u moves with its discs; one can take its Redump name")
+        let outcome = Organize.apply(plan, rename: true, retroArchFolder: ra3)
+        check(outcome.moved == 5 && outcome.renamed == 1, "moved 5, renamed 1", "\(outcome)")
+        check(exists(lib2.appendingPathComponent("PlayStation/Star (Disc 2).chd")) && exists(lib2.appendingPathComponent("PlayStation/Star.m3u"))
+              && exists(lib2.appendingPathComponent("Dreamcast/Sea Adventure (USA).chd")) && exists(lib2.appendingPathComponent("Wii/wii game.rvz"))
+              && exists(lib2.appendingPathComponent("Saturn/already sorted.chd")) && exists(lib2.appendingPathComponent("mystery.chd")),
+              "files are in their system folders (already-sorted and unknown ones untouched)",
+              ((fm.enumerator(atPath: lib2.path)?.allObjects as? [String]) ?? []).sorted().joined(separator: ", "))
+        check(RedumpCache.lookup(lib2.appendingPathComponent("Dreamcast/Sea Adventure (USA).chd"))?.isMatch == true
+              && ConversionLog.load()[W.appendingPathComponent("somewhere/dc game.gdi").standardizedFileURL.path]?.first?.hasSuffix("Dreamcast/Sea Adventure (USA).chd") == true,
+              "the Redump result and Clean Up Originals' record follow the move")
+        let ra3Items = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: ra3.appendingPathComponent("Sony - PlayStation 2.lpl")))) as? [String: Any])?["items"] as? [[String: Any]] ?? []
+        check(ra3Items.first?["path"] as? String == lib2.appendingPathComponent("PlayStation 2/ps2 game.chd").standardizedFileURL.path && outcome.playlistEntries == 1,
+              "RetroArch playlists point at the new places", "\(ra3Items)")
+        let again = Organize.plan(folder: lib2, style: .readable, index: lib2Index, checked: RedumpCache.all(), chdman: chdman)
+        check(again.moves.isEmpty, "a second run finds nothing to move")
+
         // MARK: Extra copies
         section("Extra copies")
         let ex = W.appendingPathComponent("extra"); try? fm.createDirectory(at: ex.appendingPathComponent("PlayStation"), withIntermediateDirectories: true)
