@@ -66,9 +66,26 @@ struct LibraryReport: Sendable {
     var identicalBytes = 0.0
     var versions: [Versions] = []
 
+    /// How much of Redump's list for one system you have.
+    struct Completeness: Identifiable, Sendable {
+        let id: String              // redump.org's name for the system ("psx"), or "" for DATs added by hand
+        let name: String
+        let total: Int
+        let have: [String: URL]     // Redump game → one of your files for it
+        let missing: [String]       // sorted
+    }
+    var completeness: [Completeness] = []
+
+    /// Damage checks (File → Check for Damaged Files…): what can be checked here, how many have a current
+    /// result, and the ones found damaged.
+    var damageCheckable: [URL] = []
+    var damageChecked = 0
+    var damaged: [(url: URL, why: String)] = []
+
     nonisolated static func build(folder: URL, outputDir: URL?, sevenZip: URL?, log: [String: [String]],
                                   redump: RedumpIndex, checked: [String: RedumpCache.Entry] = [:],
                                   patchesFolder: URL? = nil, preferLanguage: String? = nil,
+                                  damageChecks: [String: DamageRecord.Entry] = [:],
                                   status: @escaping @Sendable (String) -> Void) -> LibraryReport {
         var r = LibraryReport()
         let fm = FileManager.default
@@ -93,6 +110,17 @@ struct LibraryReport: Sendable {
             case .some: r.redumpNotMatching.append(chd)
             case .none: r.redumpUnchecked.append(chd)
             }
+        }
+
+        status("Comparing with Redump's lists…")
+        r.completeness = completeness(files: all, index: redump, checked: checked)
+
+        r.damageCheckable = all.filter { DamageCheck.extensions.contains($0.pathExtension.lowercased()) }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        for f in r.damageCheckable {
+            guard let e = DamageRecord.entry(for: f, in: damageChecks) else { continue }
+            r.damageChecked += 1
+            if e.damaged { r.damaged.append((f, e.why ?? "damaged")) }
         }
 
         status("Matching originals with CHDs…")
@@ -141,6 +169,42 @@ struct LibraryReport: Sendable {
                                         unconverted: unconverted, leftovers: r.leftovers, chds: r.chds)
         }
         return r
+    }
+
+    /// Files that can hold a whole game: disc images, archives, and compressed formats.
+    nonisolated static let gameFileExtensions: Set<String> =
+        Converter.inputExtensions.union(Converter.archiveExtensions).union(["chd", "rvz", "cso", "zso", "ecm"])
+
+    /// For each system with at least one game here: how many of Redump's games you have, and which are
+    /// missing. A file counts for a game when it's remembered as matching it, or is named exactly as in
+    /// Redump (any game format: CHD, RVZ, CSO, .cue, .iso, a zip…). Each disc of a multi-disc game counts
+    /// on its own, as Redump lists them.
+    nonisolated static func completeness(files: [URL], index: RedumpIndex, checked: [String: RedumpCache.Entry]) -> [Completeness] {
+        guard !index.isEmpty else { return [] }
+        let byName = Dictionary(index.trackCount.keys.map { (Converter.safeFileName($0).lowercased(), $0) }, uniquingKeysWith: { a, b in min(a, b) })
+        // CHDs and RVZs first, so they're the file shown for a game you also have the original of.
+        let candidates = files.filter { gameFileExtensions.contains($0.pathExtension.lowercased()) }
+            .sorted { a, b in
+                let (ca, cb) = (["chd", "rvz"].contains(a.pathExtension.lowercased()), ["chd", "rvz"].contains(b.pathExtension.lowercased()))
+                return ca != cb ? ca : a.path.localizedStandardCompare(b.path) == .orderedAscending
+            }
+        var have: [String: URL] = [:]
+        for f in candidates {
+            var game: String?
+            if case .match(let g) = RedumpCache.result(for: f, in: checked, datStamp: index.stamp) { game = g }
+            if game == nil || index.trackCount[game!] == nil { game = byName[Converter.gameName(f).lowercased()] }
+            if let game, have[game] == nil { have[game] = f }
+        }
+        var bySystem: [String: [String]] = [:]
+        for game in index.trackCount.keys { bySystem[index.system[game] ?? "", default: []].append(game) }
+        return bySystem.compactMap { slug, games -> Completeness? in
+            var mine: [String: URL] = [:], missing: [String] = []
+            for g in games { if let f = have[g] { mine[g] = f } else { missing.append(g) } }
+            guard !mine.isEmpty else { return nil }
+            return Completeness(id: slug, name: slug.isEmpty ? "DATs you added" : RedumpDB.systemName(slug), total: games.count,
+                                have: mine, missing: missing.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+        }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     /// The SHA-1 of the disc data a CHD holds, from its header (CHD versions 4 and 5), without reading the rest.
@@ -287,6 +351,8 @@ extension LibraryReport {
             rows.append([section, name ?? url.lastPathComponent, url.deletingLastPathComponent().path, details, size.map { String(Int64($0)) } ?? ""])
         }
         rows.append(["Summary", "CHDs", "", "\(chds.count)", String(Int64(chdBytes))])
+        for c in completeness { rows.append(["Redump collection", c.name, "", "have \(c.have.count) of \(c.total)", ""]) }
+        for d in damaged { add("Damaged", d.url, d.why, size: totalSize([d.url])) }
         for u in unconverted { add("Not converted yet", u, size: totalSize(Converter.sourceFiles(for: u))) }
         for i in leftovers { add("Originals with CHDs", i.source, "has " + i.chds.map(\.lastPathComponent).joined(separator: ", "), size: i.bytes) }
         for m in missingDiscs {
@@ -313,6 +379,10 @@ extension LibraryReport {
         if let folder { out += folder.path + "\n" }
         out += Date().formatted(date: .long, time: .shortened) + "\n\n"
         out += "CHDs: \(chds.count) (\(formatBytes(chdBytes)))\n"
+        if !completeness.isEmpty {
+            out += "\nAgainst Redump's lists:\n"
+            for c in completeness { out += "  \(c.name): \(c.have.count) of \(c.total)\n" }
+        }
         func section(_ title: String, _ lines: [String]) {
             out += "\n\(title): \(lines.count)\n"
             for l in lines { out += "  \(l)\n" }
@@ -329,8 +399,20 @@ extension LibraryReport {
         })
         section("Games in several versions", versions.map { "\($0.title): " + $0.files.map(\.lastPathComponent).joined(separator: ", ") })
         section("Don't match Redump", redumpNotMatching.map(\.lastPathComponent))
+        if damageChecked > 0 { section("Damaged (from the last damage check)", damaged.map { "\($0.url.lastPathComponent): \($0.why)" }) }
         out += "\nMatch Redump: \(redumpMatched)   Not checked yet: \(redumpUnchecked.count)\n"
         return out
+    }
+
+    /// Every game in Redump's lists for the systems shown, and whether you have it: System, Game, Status, File.
+    nonisolated func collectionCSV() -> String {
+        var rows = [["System", "Game", "Status", "File"]]
+        for c in completeness {
+            let all = (Array(c.have.keys) + c.missing).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            for g in all { rows.append([c.name, g, c.have[g] == nil ? "Missing" : "Have", c.have[g]?.path ?? ""]) }
+        }
+        func cell(_ s: String) -> String { s.contains(where: { ",\"\n".contains($0) }) ? "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" : s }
+        return rows.map { $0.map(cell).joined(separator: ",") }.joined(separator: "\n") + "\n"
     }
 }
 
@@ -354,9 +436,11 @@ final class Library: ObservableObject {
         let checked = RedumpCache.all()
         let patches = PatchLibrary.shared.active ? PatchLibrary.shared.folder : nil
         let prefer = PatchLibrary.preferredLanguage
+        let damage = DamageRecord.all()
         Task.detached {
             let r = LibraryReport.build(folder: folder, outputDir: outDir, sevenZip: sevenZip, log: ConversionLog.load(),
-                                        redump: redump, checked: checked, patchesFolder: patches, preferLanguage: prefer) { s in
+                                        redump: redump, checked: checked, patchesFolder: patches, preferLanguage: prefer,
+                                        damageChecks: damage) { s in
                 Task { @MainActor in self.status = s }
             }
             await MainActor.run { self.report = r; self.isScanning = false }
@@ -427,6 +511,7 @@ struct LibraryView: View {
     @ObservedObject private var redump = RedumpDB.shared
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    @State private var missingFilter = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -452,7 +537,7 @@ struct LibraryView: View {
             } else if let r = m.report {
                 report(r)
             } else {
-                Text("The report shows which games are converted, which aren't, originals you can clean up, multi-disc games with a disc missing, identical copies, games kept in several versions, and ones without a playlist. Nothing is changed until you click an action.")
+                Text("The report shows which games are converted, which aren't, how much of each system's Redump list you have, originals you can clean up, multi-disc games with a disc missing, identical copies, games kept in several versions, and ones without a playlist. Nothing is changed until you click an action.")
                     .foregroundStyle(.secondary)
                 Spacer()
             }
@@ -473,6 +558,18 @@ struct LibraryView: View {
                 if !redump.index.isEmpty {
                     row("Named as in Redump", "\(r.redumpNamed) of \(r.chds.count)")
                 }
+                if !r.damageCheckable.isEmpty {
+                    HStack {
+                        Text("Checked for damage")
+                        Spacer()
+                        Text("\(r.damageChecked) of \(r.damageCheckable.count)" + (r.damaged.isEmpty ? "" : " · \(r.damaged.count) damaged"))
+                            .foregroundStyle(r.damaged.isEmpty ? Color.secondary : Color.red).monospacedDigit()
+                        Button("Check for Damage…") {
+                            DamageCheck.shared.clear(); DamageCheck.shared.add(r.damageCheckable); openWindow(id: "damage")
+                        }
+                        .help("Reads every CHD and GameCube/Wii disc here all the way through, to find damage from a failing drive or a bad copy.")
+                    }
+                }
                 if !r.chds.isEmpty {
                     HStack {
                         Button("Sort into System Folders…") { m.sortIntoSystemFolders() }
@@ -488,6 +585,18 @@ struct LibraryView: View {
                     .disabled(c.isRunning)
                 }
             } header: { Text("Summary") }
+
+            if !r.damaged.isEmpty {
+                Section {
+                    ForEach(r.damaged, id: \.url) { d in fileRow(d.url, detail: d.why) }
+                } header: {
+                    header("Damaged: \(r.damaged.count)", nil, action: ("Show in Finder", {
+                        NSWorkspace.shared.activateFileViewerSelecting(r.damaged.map(\.url))
+                    }))
+                }
+            }
+
+            collection(r)
 
             Section {
                 if r.unconverted.isEmpty { Text("Everything here is converted.").foregroundStyle(.secondary) }
@@ -610,6 +719,55 @@ struct LibraryView: View {
         }
     }
 
+    /// Each system's games against Redump's list, with the missing ones (filterable).
+    @ViewBuilder private func collection(_ r: LibraryReport) -> some View {
+        Section {
+            if redump.index.isEmpty {
+                Text("Load Redump DATs in Settings to see how much of each system's list you have.").font(.caption).foregroundStyle(.secondary)
+            } else if r.completeness.isEmpty {
+                Text("No game here is named as in Redump or matched to it yet. Check your games against Redump, or rename them to their Redump names, and they'll count here.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Every game in Redump's list counts, all regions, demos and betas included, and each disc on its own. A game counts as yours when it matches Redump or is named exactly as in Redump.")
+                    .font(.caption).foregroundStyle(.secondary)
+                TextField("Filter missing games, e.g. “USA” or “Final Fantasy”", text: $missingFilter)
+                    .textFieldStyle(.roundedBorder)
+                ForEach(r.completeness) { c in
+                    let words = missingFilter.lowercased().split(separator: " ").map(String.init)
+                    let shown = words.isEmpty ? c.missing : c.missing.filter { g in let l = g.lowercased(); return words.allSatisfy { l.contains($0) } }
+                    DisclosureGroup {
+                        if shown.isEmpty { Text(c.missing.isEmpty ? "You have all of them." : "No missing game matches the filter.").foregroundStyle(.secondary) }
+                        ForEach(shown.prefix(300), id: \.self) { Text($0).lineLimit(1).truncationMode(.middle) }
+                        more(shown.count, limit: 300)
+                    } label: {
+                        HStack {
+                            Text(c.name)
+                            Spacer()
+                            ProgressView(value: Double(c.have.count), total: Double(max(c.total, 1))).frame(width: 90)
+                            Text("\(c.have.count.formatted()) of \(c.total.formatted())").foregroundStyle(.secondary).monospacedDigit()
+                                .frame(minWidth: 110, alignment: .trailing)
+                        }
+                    }
+                }
+            }
+        } header: {
+            header("Collection against Redump", nil, action: r.completeness.isEmpty ? nil : ("Save Have/Missing List…", { exportCollection(r) }))
+        }
+    }
+
+    private func exportCollection(_ r: LibraryReport) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "Collection – \(m.folder?.lastPathComponent ?? "Games").csv"
+        panel.canCreateDirectories = true
+        let done: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try r.collectionCSV().write(to: url, atomically: true, encoding: .utf8); m.message = "Saved \(url.lastPathComponent)." }
+            catch { m.message = "Couldn't save the list: \(error.localizedDescription)" }
+        }
+        if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
+    }
+
     private func row(_ label: String, _ value: String) -> some View {
         HStack { Text(label); Spacer(); Text(value).foregroundStyle(.secondary).monospacedDigit() }
     }
@@ -632,8 +790,8 @@ struct LibraryView: View {
         .contextMenu { Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) } }
     }
 
-    @ViewBuilder private func more(_ count: Int) -> some View {
-        if count > 200 { Text("…and \(count - 200) more").font(.caption).foregroundStyle(.secondary) }
+    @ViewBuilder private func more(_ count: Int, limit: Int = 200) -> some View {
+        if count > limit { Text("…and \(count - limit) more").font(.caption).foregroundStyle(.secondary) }
     }
 
     /// Saves the report as CSV (for Numbers or Excel) or plain text.

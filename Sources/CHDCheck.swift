@@ -122,6 +122,7 @@ final class CHDCheck: ObservableObject {
                 CHDCheck.fixPlaylists(in: old.deletingLastPathComponent(), from: old.lastPathComponent, to: new.lastPathComponent)
                 ConversionLog.renamed(old, to: new)
                 RedumpCache.move(old, to: new)
+                DamageRecord.move(old, to: new)
                 items[i].url = new
                 renamed += 1
             } catch {

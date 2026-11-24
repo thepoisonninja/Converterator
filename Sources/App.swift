@@ -49,6 +49,8 @@ struct ConverteratorApp: App {
             .defaultSize(width: 720, height: 640)
         Window("Check Against Redump", id: "chdcheck") { CHDCheckView() }
             .defaultSize(width: 680, height: 540)
+        Window("Check for Damaged Files", id: "damage") { DamageCheckView() }
+            .defaultSize(width: 700, height: 540)
         Settings { SettingsView() }
     }
 }
@@ -69,6 +71,7 @@ struct AppCommands: Commands {
             Divider()
             Button("Clean Up Originals…") { openWindow(id: "cleanup") }
             Button("Check Against Redump…") { openWindow(id: "chdcheck") }
+            Button("Check for Damaged Files…") { openWindow(id: "damage") }
             Button("Library Report…") { openWindow(id: "library") }
         }
         CommandMenu("Convert") {

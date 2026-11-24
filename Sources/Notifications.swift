@@ -30,6 +30,19 @@ enum Notifier {
     }
 }
 
+extension Notifier {
+    /// A notification for something long that finished while you're in another app.
+    @MainActor
+    static func post(id: String, title: String, body: String) {
+        guard available, !NSApp.isActive else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+}
+
 extension Optional {
     /// Keeps the value only if it passes `test`.
     func filter(_ test: (Wrapped) -> Bool) -> Wrapped? { flatMap { test($0) ? $0 : nil } }

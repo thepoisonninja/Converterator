@@ -119,6 +119,7 @@ enum Organize {
             } catch { out.skipped.append(m.from.lastPathComponent); continue }
             ConversionLog.renamed(m.from, to: to)
             RedumpCache.move(m.from, to: to)
+            DamageRecord.move(m.from, to: to)
             moves[m.from] = to
             record.moves.append([m.from.path, to.path])
             // Its LibCrypt .sbi goes with it, renamed to match.
@@ -177,6 +178,7 @@ enum Organize {
             } catch { skipped += 1; continue }
             ConversionLog.renamed(from, to: to)
             RedumpCache.move(from, to: to)
+            DamageRecord.move(from, to: to)
             back[from] = to
             restored += 1
         }

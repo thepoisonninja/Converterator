@@ -939,6 +939,103 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
                                    redumpNames: ["Real Game (USA)"], checked: [:], datStamp: "").lastPathComponent == "game copy 2.chd",
               "the copy a playlist lists stays, whatever its name")
 
+        // MARK: Collection against Redump
+        section("Collection against Redump")
+        let col = W.appendingPathComponent("collection"); try? fm.createDirectory(at: col.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: col.appendingPathComponent("Alpha (USA).chd"))
+        try! "FILE \"x.bin\" BINARY\n".write(to: col.appendingPathComponent("sub/Beta (Europe).cue"), atomically: true, encoding: .utf8)
+        try! Data().write(to: col.appendingPathComponent("Gamma (Japan).zip"))
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: col.appendingPathComponent("mystery.chd"))
+        try! Data().write(to: col.appendingPathComponent("Epsilon (USA).txt"))   // not a game file
+        RedumpCache.store(col.appendingPathComponent("mystery.chd"), .match("Delta (USA)"))
+        var colIndex = RedumpIndex()
+        for (g, sys) in [("Alpha (USA)", "psx"), ("Beta (Europe)", "psx"), ("Delta (USA)", "psx"), ("Epsilon (USA)", "psx"),
+                         ("Gamma (Japan)", "ss"), ("Zeta (USA)", "ss"), ("Only (USA)", "dc"), ("Hand Added (USA)", "")] {
+            colIndex.trackCount[g] = 1
+            if !sys.isEmpty { colIndex.system[g] = sys }
+            colIndex.roms[String(repeating: "0", count: 30) + String(format: "%010d", colIndex.roms.count)] = [.init(game: g, name: g + ".bin")]
+        }
+        try! Data().write(to: col.appendingPathComponent("hand added (usa).iso"))
+        let colReport = LibraryReport.build(folder: col, outputDir: nil, sevenZip: nil, log: [:], redump: colIndex, checked: RedumpCache.all()) { _ in }
+        let comp = colReport.completeness
+        check(comp.map(\.name) == ["DATs you added", "Sega Saturn", "Sony PlayStation"], "systems you have games for are listed (not Dreamcast)", "\(comp.map(\.name))")
+        let psxSet = comp.first { $0.id == "psx" }
+        check(psxSet?.have.count == 3 && psxSet?.total == 4 && psxSet?.missing == ["Epsilon (USA)"],
+              "PlayStation: 3 of 4, by Redump name or remembered match; Epsilon missing", "\(psxSet.map { "\($0.have.keys.sorted()) missing \($0.missing)" } ?? "none")")
+        check(psxSet?.have["Delta (USA)"]?.lastPathComponent == "mystery.chd" && psxSet?.have["Beta (Europe)"]?.lastPathComponent == "Beta (Europe).cue",
+              "a remembered match counts whatever the file's name; originals in subfolders count")
+        check(comp.first { $0.id == "ss" }.map { $0.have.count == 1 && $0.total == 2 } == true, "Saturn: 1 of 2 (a zip named as in Redump counts)")
+        check(comp.first { $0.id == "" }?.have.count == 1, "names match whatever their capitals")
+        let colCSV = colReport.collectionCSV()
+        check(colCSV.contains("Sony PlayStation,Epsilon (USA),Missing,\n") && colCSV.contains("Sega Saturn,Gamma (Japan),Have,/") && colCSV.contains("/collection/Gamma (Japan).zip\n"),
+              "the have/missing list saves as CSV", colCSV)
+        check(colReport.csv().contains("Redump collection,Sony PlayStation,,have 3 of 4,"), "the report's CSV has each system's count")
+        check(LibraryReport.completeness(files: [], index: RedumpIndex(), checked: [:]).isEmpty, "no DATs, no list")
+
+        // MARK: Damaged files
+        section("Damaged files")
+        let dmg = workspace("damage", from: F, ["chd/game.chd", "chd/bad.chd"], into: W)
+        let dolphin = Converter.findTool("dolphin-tool")!
+        // A GameCube disc of random data: dolphin-tool stores it uncompressed, so damage to it reads without error
+        var randomISO = FileHandle(forReadingAtPath: "/dev/urandom")!.readData(ofLength: 4 << 20)
+        randomISO.replaceSubrange(0..<6, with: Data("GTEST2".utf8)); randomISO.replaceSubrange(0x1C..<0x20, with: Data([0xC2, 0x33, 0x9F, 0x3D]))
+        let randISO = W.appendingPathComponent("random.iso"); try! randomISO.write(to: randISO)
+        func dolphinRVZ(_ iso: URL, _ out: URL) {
+            let p = Process(); p.executableURL = dolphin
+            p.arguments = ["convert", "-i", iso.path, "-o", out.path, "-f", "rvz", "-c", "zstd", "-l", "5", "-b", "131072"]
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try? p.run(); p.waitUntilExit()
+        }
+        let randRVZ = dmg.appendingPathComponent("random.rvz")
+        dolphinRVZ(randISO, randRVZ)
+        let rvzData = try! Data(contentsOf: randRVZ)
+        try! rvzData.prefix(rvzData.count * 6 / 10).write(to: dmg.appendingPathComponent("cut.rvz"))
+        let dc = DamageCheck.shared
+        dc.clear(); dc.recheck = false
+        dc.add([dmg])
+        check(dc.items.map(\.url.lastPathComponent) == ["bad.chd", "cut.rvz", "game.chd", "random.rvz"], "CHDs and RVZs in a folder are added",
+              "\(dc.items.map(\.url.lastPathComponent))")
+        dc.start(); while dc.isRunning { try? await Task.sleep(for: .milliseconds(100)) }
+        func dItem(_ n: String) -> DamageCheck.Item? { dc.items.first { $0.url.lastPathComponent == n } }
+        func dWhy(_ n: String) -> String { dItem(n).map { "\($0.state) \($0.why ?? "")" } ?? "missing" }
+        check(dItem("game.chd")?.state == .ok && dItem("random.rvz")?.state == .ok, "undamaged CHD and RVZ pass", "\(dWhy("game.chd")); \(dWhy("random.rvz"))")
+        check(dItem("bad.chd")?.state == .damaged, "a damaged CHD is found", dWhy("bad.chd"))
+        check(dItem("cut.rvz")?.state == .damaged, "an RVZ cut short is found", dWhy("cut.rvz"))
+        check(DamageRecord.entry(for: randRVZ, in: DamageRecord.all())?.sha1 == sha1(randISO), "the RVZ's disc SHA-1 is remembered")
+        check(dc.message.hasPrefix("2 damaged, 2 undamaged."), "summary", dc.message)
+        // A second check skips files found undamaged recently, and reads damaged ones again
+        dc.clear(); dc.add([dmg]); dc.start(); while dc.isRunning { try? await Task.sleep(for: .milliseconds(100)) }
+        check(dItem("game.chd")?.remembered != nil && dItem("bad.chd")?.remembered == nil && dItem("bad.chd")?.state == .damaged,
+              "files found undamaged recently aren't read again; damaged ones are", dc.message)
+        // Damage dolphin-tool can't see: the data changes but the file's size and date don't
+        let attrs = try! fm.attributesOfItem(atPath: randRVZ.path)
+        let fh = try! FileHandle(forWritingTo: randRVZ); try! fh.seek(toOffset: 300_000); fh.write(Data(repeating: 0x58, count: 16)); try! fh.close()
+        try! fm.setAttributes([.modificationDate: attrs[.modificationDate]!], ofItemAtPath: randRVZ.path)
+        dc.recheck = true
+        dc.clear(); dc.add([randRVZ]); dc.start(); while dc.isRunning { try? await Task.sleep(for: .milliseconds(100)) }
+        check(dItem("random.rvz")?.state == .damaged && dItem("random.rvz")?.why?.contains("changed since") == true,
+              "an RVZ whose disc data changed since its last check is found", dWhy("random.rvz"))
+        dc.clear(); dc.add([randRVZ]); dc.start(); while dc.isRunning { try? await Task.sleep(for: .milliseconds(100)) }
+        check(dItem("random.rvz")?.state == .damaged, "…and still found on the next check")
+        dc.recheck = false
+        // Against Redump: an RVZ that matched before is compared with Redump's SHA-1
+        let good = await DamageCheck.check(dmg.appendingPathComponent("random.rvz"), chdman: c.chdman!, dolphin: dolphin, previous: nil,
+                                           redump: ("Rand (USA)", ["0000000000000000000000000000000000000000"]), started: { _ in }, progress: { _ in })
+        if case .damaged(let why) = good { check(why.contains("Rand (USA)"), "an RVZ that no longer matches its Redump game is damaged", why) }
+        else { check(false, "an RVZ that no longer matches its Redump game is damaged", "\(good)") }
+        // The Library Report shows it
+        let dmgReport = LibraryReport.build(folder: dmg, outputDir: nil, sevenZip: nil, log: [:], redump: RedumpIndex(), checked: [:],
+                                            damageChecks: DamageRecord.all()) { _ in }
+        check(dmgReport.damageCheckable.count == 4 && dmgReport.damageChecked == 4
+              && dmgReport.damaged.map(\.url.lastPathComponent).sorted() == ["bad.chd", "cut.rvz", "random.rvz"],
+              "the Library Report counts checked and damaged files", "\(dmgReport.damageChecked) \(dmgReport.damaged.map(\.url.lastPathComponent))")
+        check(dmgReport.csv().contains("Damaged,bad.chd,"), "…and lists them in its CSV")
+        // A result follows its file when it's renamed
+        DamageRecord.move(dmg.appendingPathComponent("game.chd"), to: dmg.appendingPathComponent("Game (USA).chd"))
+        try! fm.moveItem(at: dmg.appendingPathComponent("game.chd"), to: dmg.appendingPathComponent("Game (USA).chd"))
+        check(DamageRecord.entry(for: dmg.appendingPathComponent("Game (USA).chd"), in: DamageRecord.all())?.damaged == false, "a result follows a renamed file")
+        dc.clear()
+
         // MARK: Watch folder
         section("Watch folder")
         let wf = WatchFolder.shared, watched = W.appendingPathComponent("watched")
